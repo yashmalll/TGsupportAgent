@@ -116,6 +116,8 @@ class Bridge:
                     names = await self.names()
                     await message.answer("\n".join(("→ " if n == self.active else "") + n for n in names) or "Нет сессий.")
                 elif command == "/switch":
+                    if not arg.strip():
+                        raise ValueError("Укажи имя: /switch tgcli-имя")
                     await self.target(arg.strip())
                     self.active = arg.strip()
                     await self.output(await self.screen(await self.target()), True)
