@@ -3,7 +3,7 @@ name = "tg-support-agent"
 version = "0.1.0"
 description = "Private Telegram bridge to local CLI sessions"
 requires-python = ">=3.11"
-dependencies = ["aiogram>=3.20,<4", "python-dotenv>=1,<2"]
+dependencies = ["aiogram>=3.20,<4", "python-dotenv>=1,<2", "pyte>=0.8.2,<0.9"]
 
 [project.scripts]
 tg-cli = "tgbridge:main"
@@ -13,4 +13,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["tgbridge"]
+py-modules = ["tgbridge", "console_output"]
