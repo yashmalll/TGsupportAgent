@@ -1,5 +1,30 @@
 {
-  "codex": {"command": ["codex"], "cwd": "~"},
-  "claude": {"command": ["claude"], "cwd": "~"},
-  "shell": {"command": ["bash"], "cwd": "~"}
+  "codex": {
+    "command": [
+      "codex"
+    ],
+    "cwd": "~"
+  },
+  "claude": {
+    "command": [
+      "claude"
+    ],
+    "cwd": "~"
+  },
+  "shell": {
+    "command": [
+      "bash"
+    ],
+    "cwd": "~"
+  },
+  "kimi": {
+    "command": [
+      "kimi"
+    ]
+  },
+  "agy": {
+    "command": [
+      "agy"
+    ]
+  }
 }

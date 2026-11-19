@@ -49,15 +49,18 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             path.write_bytes(('first <tag>\r\n' + 'line\r\n' * 1000).encode())
             with patch('tgbridge.tmux', AsyncMock(return_value='0:\n')):
                 await self.bridge.refresh('tgcli-test')
+                await self.bridge.deliver_output('tgcli-test')
                 sent = ''.join(c.args[1].split('<pre>', 1)[1].split('</pre>', 1)[0] for c in self.bot.send_message.call_args_list)
                 self.assertIn('first &lt;tag&gt;', sent)
                 self.assertEqual(sent.count('line'), 1000)
                 count = self.bot.send_message.await_count
                 await self.bridge.refresh('tgcli-test')
+                await self.bridge.deliver_output('tgcli-test')
                 self.assertEqual(self.bot.send_message.await_count, count)
                 with path.open('ab') as file:
                     file.write(b'next answer\r\n')
                 await self.bridge.refresh('tgcli-test')
+                await self.bridge.deliver_output('tgcli-test')
                 self.assertIn('next answer', self.bot.edit_message_text.call_args.args[0])
                 self.assertEqual(self.bot.send_message.await_count, count)
                 self.bot.delete_message.assert_not_awaited()
@@ -140,7 +143,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.handle(message)
         markup = message.answer.call_args.kwargs['reply_markup']
         self.assertTrue(markup.is_persistent)
-        self.assertEqual(sum(len(row) for row in markup.keyboard), 6)
+        self.assertGreaterEqual(sum(len(row) for row in markup.keyboard), 6)
 
     async def test_startup_sends_action_hints_and_persistent_menu_to_owner(self):
         await self.bridge.announce_startup()
@@ -185,7 +188,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tmux.call_args.args, ('send-keys', '-t', 'tgcli-test:0.0', 'Enter'))
         self.assertEqual(query.answer.await_count, 1)
 
-    async def test_project_button_launches_selected_path(self):
+    async def test_project_then_agent_launches_selected_path(self):
         with tempfile.TemporaryDirectory(prefix='projects with spaces ') as directory:
             self.bridge.project_choices['chosen'] = Path(directory)
             message = Message.model_validate({'message_id': 1, 'date': 0,
@@ -193,11 +196,18 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 'from': {'id': 999, 'is_bot': True, 'first_name': 'Bot'}, 'text': 'Projects'})
             query = SimpleNamespace(from_user=SimpleNamespace(id=123), message=message,
                                     data='project:chosen', answer=AsyncMock())
-            with patch.object(self.bridge, 'handle', new=AsyncMock()) as handle:
+            self.bridge.profiles['kimi'] = {'command': ['kimi']}
+            with patch.object(self.bridge, 'handle', new=AsyncMock()) as handle, \
+                 patch.object(Message, 'answer', new=AsyncMock()) as answer:
                 await self.bridge.project(query)
+                handle.assert_not_awaited()
+                buttons = answer.call_args.kwargs['reply_markup'].inline_keyboard
+                button = next(row[0] for row in buttons if row[0].text == 'kimi')
+                query.data = button.callback_data
+                await self.bridge.agent(query)
                 import shlex
                 forwarded = handle.call_args.args[0]
-                self.assertEqual(shlex.split(forwarded.text), ['/startcli', 'codex', directory])
+                self.assertEqual(shlex.split(forwarded.text), ['/startcli', 'kimi', directory])
                 self.assertEqual(forwarded.from_user.id, 123)
             query.from_user = SimpleNamespace(id=456)
             with patch.object(self.bridge, 'handle', new=AsyncMock()) as handle:

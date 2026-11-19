@@ -9,11 +9,15 @@ import re
 import shlex
 import shutil
 import uuid
+import time
+import sys
+from datetime import datetime
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery,
-                           KeyboardButton, ReplyKeyboardMarkup)
-from aiogram.exceptions import TelegramBadRequest
+                           KeyboardButton, ReplyKeyboardMarkup, BufferedInputFile)
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from dotenv import load_dotenv
 from console_output import ConsoleOutput
 
@@ -26,6 +30,13 @@ MENU_ACTIONS = {
     "📺 Экран": "/attach",
     "🛑 Завершить сессию": "/stop",
     "❓ Помощь": "/help",
+    "✍️ Составить задание": "/draft",
+    "📨 Отправить задание": "/submit",
+    "⚙️ Вид вывода": "/settings",
+    "📄 Лог": "/log",
+    "↩️ Продолжить": "/resume",
+    "🚫 Отменить задание": "/cancel",
+    "🤖 Выбрать CLI": "/cli",
 }
 
 
@@ -58,6 +69,11 @@ HELP = """/menu — показать меню кнопок
 /switch имя — выбрать сессию
 /attach — экран терминала
 /stop имя — завершить сессию
+/cli — выбрать CLI, включая Kimi и agy
+/draft, /submit, /cancel — составить, отправить или отменить задание
+/settings — режим отображения
+/log — скачать сохранённый вывод
+/resume — последняя сессия
 Обычный текст отправляется в выбранный CLI с Enter.
 Кнопки управляют выбранной сессией. Команды CLI можно отправить текстом /send текст.
 Вывод дополняется в одном сообщении; длинные ответы продолжаются в следующих.
@@ -81,7 +97,7 @@ def resolve_cli(command):
         return found
     home = Path.home()
     directories = [home / ".local/bin", home / ".npm-global/bin",
-                   home / ".npm/bin", home / ".volta/bin", home / ".cargo/bin"]
+                   home / ".npm/bin", home / ".volta/bin", home / ".cargo/bin", home / ".kimi-code/bin"]
     directories += sorted((home / ".nvm/versions/node").glob("*/bin"), reverse=True)
     directories += sorted((home / ".local/share/fnm/node-versions").glob("*/installation/bin"), reverse=True)
     for directory in directories:
@@ -98,12 +114,70 @@ class Bridge:
         self.active = None
         self.projects_dir = Path(projects_dir).expanduser().resolve() if projects_dir else None
         self.project_choices = {}
+        self.agent_choices = {}
         self.streams = {}
         self.outboxes = {}
         self.output_messages = {}
         self.output_dir = Path(__file__).resolve().parent / ".tgbridge-output"
         self.finished = set()
         self.lock = asyncio.Lock()
+        self.delivery_lock = asyncio.Lock()
+        self.mode = "compact"
+        self.metadata = {}
+        self.draft = None
+        self.waiting = {}
+        self.dead_observed = {}
+        self.offsets = {}
+        self.retry_at = 0
+        self.durable = False
+
+    def save_state(self):
+        if not self.durable:
+            return
+        self.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data = dict(active=self.active, mode=self.mode, metadata=self.metadata,
+                    draft=self.draft, waiting=self.waiting, offsets=self.offsets,
+                    outboxes=self.outboxes, finished=list(self.finished))
+        temp = self.output_dir / "state.tmp"
+        temp.write_text(json.dumps(data, ensure_ascii=False))
+        temp.chmod(0o600)
+        temp.replace(self.output_dir / "state.json")
+
+    def load_state(self):
+        self.durable = True
+        try:
+            data = json.loads((self.output_dir / "state.json").read_text())
+            if not isinstance(data, dict) or data.get('mode', 'compact') not in ('compact', 'full', 'notify'):
+                raise ValueError('Некорректный файл состояния')
+            for key in ('metadata', 'waiting', 'offsets', 'outboxes'):
+                if key in data and not isinstance(data[key], dict):
+                    raise ValueError('Некорректное поле состояния: ' + key)
+            self.finished = set(data.get('finished', []))
+            for key in ('active', 'mode', 'metadata', 'draft', 'waiting', 'offsets', 'outboxes'):
+                if key in data:
+                    setattr(self, key, data[key])
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError):
+            logging.exception("Не удалось восстановить состояние")
+
+    def enqueue(self, name, text, controls=False, notify=False):
+        self.outboxes.setdefault(name, []).append((text, controls, notify))
+
+    async def session_label(self, name):
+        directory = await self.session_directory(name)
+        meta = self.metadata.get(name, {})
+        status = (await tmux('display-message', '-p', '-t', name + ':0.0',
+                             '#{pane_dead}|#{pane_current_command}|#{session_created}')).strip().split('|')
+        cli = meta.get('cli') or (status[1] if len(status) > 1 else 'CLI')
+        created = meta.get('created') or (status[2] if len(status) > 2 else '')
+        try:
+            clock = datetime.fromtimestamp(float(created)).strftime('%d.%m %H:%M')
+        except (ValueError, TypeError):
+            clock = ''
+        state = 'завершена' if status[0] == '1' else ('ждёт действия' if self.waiting.get(name) else 'работает')
+        return f'{self.project_label(directory)[:40]} · {cli} · {clock} · {state}'
+
 
     def clean(self, text):
         for value in self.secrets:
@@ -118,6 +192,13 @@ class Bridge:
             "📂 Проекты — выбрать папку и запустить Codex в ней.\n"
             "🖥 Сессии — вернуться к ранее открытой сессии.\n\n"
             "Выбери действие кнопками ниже.", reply_markup=main_menu())
+        if self.active and self.active in await self.names():
+            await self.bot.send_message(self.owner, '↩️ Последняя сессия: ' + await self.session_label(self.active),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text='Продолжить', callback_data='session:' + self.active)]]))
+        else:
+            self.active = None
+        self.save_state()
 
     def projects(self):
         if self.projects_dir is None:
@@ -146,12 +227,13 @@ class Bridge:
             await message.answer("📂 Проекты не найдены. Укажи PROJECTS_DIR в .env и перезапусти бота."
                                  "\n/startcli codex — запуск в домашней папке.")
             return
+        self.agent_choices.clear()
         self.project_choices = {uuid.uuid4().hex[:12]: path for path in projects}
         choices = list(self.project_choices.items())
         for offset in range(0, len(choices), 40):
             rows = [[InlineKeyboardButton(text="📁 " + path.name,
                      callback_data="project:" + key)] for key, path in choices[offset:offset + 40]]
-            await message.answer("📂 <b>Выбери проект</b>\nНажми на папку, чтобы запустить Codex."
+            await message.answer("📂 <b>Выбери проект</b>\nНажми на папку, затем выбери агента."
                                  "\n<code>" + escape(self.clean(str(self.projects_dir))) + "</code>",
                                  parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -163,11 +245,30 @@ class Bridge:
         if path is None:
             await answer_callback(query, "Список устарел. Открой /projects ещё раз.", show_alert=True)
             return
-        if not await answer_callback(query, "Запускаю Codex…"):
+        if not await answer_callback(query):
             return
-        # Reuse the same authorization, validation and session lock as text commands.
-        message = query.message.model_copy(update={"from_user": query.from_user,
-                    "text": "/startcli codex " + shlex.quote(str(path))})
+        rows = []
+        for profile in self.profiles:
+            token = uuid.uuid4().hex[:12]
+            self.agent_choices[token] = (path, profile)
+            rows.append([InlineKeyboardButton(text=profile, callback_data='agent:' + token)])
+        await query.message.answer('🤖 Выбери агента для проекта <b>' + escape(self.clean(path.name))
+                                   + '</b>\n📂 <code>' + escape(self.clean(str(path))) + '</code>',
+                                   parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def agent(self, query):
+        if query.from_user.id != self.owner or not query.message or query.message.chat.id != self.owner:
+            await answer_callback(query)
+            return
+        choice = self.agent_choices.get(query.data.partition(':')[2])
+        if choice is None:
+            await answer_callback(query, 'Список устарел. Открой /projects.', show_alert=True)
+            return
+        if not await answer_callback(query, 'Запускаю агента…'):
+            return
+        path, profile = choice
+        message = query.message.model_copy(update={'from_user': query.from_user,
+            'text': '/startcli ' + shlex.quote(profile) + ' ' + shlex.quote(str(path))})
         await self.handle(message)
 
     async def names(self):
@@ -201,9 +302,9 @@ class Bridge:
             return "Домашняя папка"
         return Path(directory).name or directory
 
-    def keyboard(self):
+    def keyboard(self, name=None):
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=k, callback_data=f"key:{self.active}:{k}") for k in row]
+            [InlineKeyboardButton(text=k, callback_data=f"key:{name or self.active}:{k}") for k in row]
             for row in (("↑", "↓", "Enter"), ("Tab", "Esc", "Ctrl+C"))])
 
     async def screen(self, target):
@@ -225,9 +326,26 @@ class Bridge:
         path.touch(mode=0o600, exist_ok=True)
         # Reconnect at EOF after restart; capture the existing screen once.
         reader.offset = path.stat().st_size
-        await tmux("pipe-pane", "-t", target, "cat >> " + shlex.quote(str(path)))
+        if name not in self.offsets:
+            self.offsets[name] = {str(path.stat().st_ino): reader.offset}
+        else:
+            seed = False
+        await tmux("pipe-pane", "-t", target, shlex.join([sys.executable, str(Path(__file__).with_name("stream_recorder.py")), str(path)]))
         if seed:
             reader.feed((await self.screen(target)).replace("\n", "\r\n").encode())
+        else:
+            def restore_terminal():
+                for segment in (path.with_suffix('.previous'), path):
+                    try:
+                        with segment.open('rb') as source:
+                            committed = self.offsets[name].get(str(os.fstat(source.fileno()).st_ino), 0)
+                            while committed > 0 and (data := source.read(min(65536, committed))):
+                                reader.feed(data)
+                                committed -= len(data)
+                    except FileNotFoundError:
+                        continue
+                reader.acknowledge(reader.pending()[1])
+            await asyncio.to_thread(restore_terminal)
         self.streams[name] = reader
 
     async def refresh(self, name, force=False):
@@ -235,21 +353,48 @@ class Bridge:
         if name not in self.streams:
             await self.connect_output(name)
         reader = self.streams[name]
-        await self.deliver_output(name)
         if force:
             self.output_messages.pop(name, None)
         path = self.output_dir / (name + ".bin")
-        with path.open("rb") as source:
-            source.seek(reader.offset)
-            # Drain the recorded stream, including output that scrolled off screen.
-            while data := source.read(65536):
-                reader.feed(data)
-            reader.offset = source.tell()
+        # Stop consuming when delivery falls behind; raw logs have bounded retention.
+        if sum(len(item[0]) for item in self.outboxes.get(name, [])) > 512_000 and not force:
+            return
+        positions = dict(self.offsets.get(name, {}))
+        def read_recorded():
+            drained = True
+            for segment in (path.with_suffix('.previous'), path):
+                try:
+                    with segment.open('rb') as source:
+                        inode = str(os.fstat(source.fileno()).st_ino)
+                        source.seek(positions.get(inode, 0))
+                        budget = 256 * 1024
+                        while budget > 0 and (data := source.read(min(65536, budget))):
+                            reader.feed(data)
+                            budget -= len(data)
+                        positions[inode] = source.tell()
+                        if source.tell() < os.fstat(source.fileno()).st_size:
+                            drained = False
+                            break
+                except FileNotFoundError:
+                    continue
+            alive = {str(p.stat().st_ino) for p in (path.with_suffix('.previous'), path) if p.exists()}
+            for inode in list(positions):
+                if inode not in alive:
+                    del positions[inode]
+            return drained
+        drained = await asyncio.to_thread(read_recorded)
         status = (await tmux("display-message", "-p", "-t", target,
                              "#{pane_dead}:#{pane_dead_status}")).strip()
         dead, _, code = status.partition(":")
-        text, current = reader.pending(force=force)
+        text, current = await asyncio.to_thread(reader.pending, force=force, raw=self.mode == "full")
         text = self.clean(text)
+        prompt = next((line.strip() for line in current[-12:] if re.search(
+            r'(?i)(\[y/n\]|\[yes/no\]|would you like|do you want|press enter|allow once|approve|подтверд|разрешить|нажмите enter)', line)), '')
+        if prompt and prompt != self.waiting.get(name):
+            self.enqueue(name, '⚠️ Возможно, CLI ждёт действия:\n' + self.clean(prompt)[:500], True, True)
+        self.waiting[name] = prompt
+        if self.mode == 'notify' and not force:
+            text = ''
         chunks, chunk, units = [], "", 0
         for char in text:
             size = 2 if ord(char) > 0xffff else 1
@@ -264,23 +409,44 @@ class Bridge:
         queue.extend((chunk, dead != "1" and index == len(chunks) - 1)
                      for index, chunk in enumerate(chunks))
         reader.acknowledge(current)
-        await self.deliver_output(name)
+        self.offsets[name] = positions
+        self.save_state()
         if force and not chunks:
             await self.output("(пустой экран)", controls=dead != "1")
-        if dead == "1" and name not in self.finished:
-            await self.output("⚫ CLI завершился · код " + (code or "?") + " · " + name)
+        signature = tuple(sorted(positions.items()))
+        stable_exit = self.dead_observed.get(name) == signature
+        if dead == '1':
+            self.dead_observed[name] = signature
+        else:
+            self.dead_observed.pop(name, None)
+        # Give pipe-pane one more poll to flush bytes after the process has exited.
+        if dead == "1" and drained and stable_exit and name not in self.finished:
+            self.enqueue(name, "⚫ CLI завершился · код " + (code or "?") + " · " + name, False, True)
             self.finished.add(name)
+            self.save_state()
 
     async def deliver_output(self, name):
+        if time.monotonic() < self.retry_at:
+            return
+        async with self.delivery_lock:
+            try:
+                await self._deliver_output(name)
+            except TelegramRetryAfter as exc:
+                self.retry_at = time.monotonic() + exc.retry_after
+
+    async def _deliver_output(self, name):
         queue = self.outboxes.setdefault(name, [])
-        while queue:
-            chunk, controls = queue[0]
+        delivered = 0
+        while queue and delivered < 3:
+            entry = queue[0]
+            chunk, controls = entry[:2]
+            notify = len(entry) > 2 and entry[2]
             previous = self.output_messages.get(name)
             combined = previous[1] + "\n" + chunk if previous else chunk
-            merge = previous is not None and len(combined.encode('utf-16-le')) // 2 <= 3200
+            merge = self.mode == 'compact' and not notify and previous is not None and len(combined.encode('utf-16-le')) // 2 <= 3200
             body = combined if merge else chunk
             formatted = "<code>" + escape(name) + "</code>\n<pre>" + escape(body) + "</pre>"
-            markup = self.keyboard() if controls else None
+            markup = self.keyboard(name) if controls else None
             if merge:
                 try:
                     await self.bot.edit_message_text(formatted, chat_id=self.owner,
@@ -295,18 +461,115 @@ class Bridge:
                 message_id = previous[0]
             else:
                 sent = await self.bot.send_message(self.owner, formatted,
-                    parse_mode="HTML", reply_markup=markup, disable_notification=True)
+                    parse_mode="HTML", reply_markup=markup, disable_notification=not notify)
                 message_id = sent.message_id
-            self.output_messages[name] = (message_id, body)
+            if notify:
+                self.output_messages.pop(name, None)
+            else:
+                self.output_messages[name] = (message_id, body)
             queue.pop(0)
+            delivered += 1
+            self.save_state()
+
+    async def send_payload(self, name, payload):
+        target = await self.target(name)
+        if len(payload.encode()) > 100_000:
+            raise ValueError("Задание слишком длинное: максимум 100 КБ.")
+        buffer = 'tgbridge-' + uuid.uuid4().hex
+        await tmux('set-buffer', '-b', buffer, '--', payload)
+        await tmux('paste-buffer', '-p', '-d', '-b', buffer, '-t', target)
+        await tmux('send-keys', '-t', target, 'Enter')
+        self.waiting.pop(name, None)
+        self.save_state()
+
+    async def attachment(self, message):
+        await self.target()
+        name = self.active
+        if self.draft is not None and self.draft['session'] != name:
+            raise ValueError('Черновик относится к другой сессии. Вернись к ней или /cancel.')
+        document = getattr(message, 'document', None)
+        photos = getattr(message, 'photo', None)
+        item = document or (photos[-1] if photos else None)
+        if item is None:
+            return
+        if (item.file_size or 0) > 20 * 1024 * 1024:
+            raise ValueError('Максимальный размер вложения — 20 МБ.')
+        raw_directory = (await tmux('display-message', '-p', '-t', name + ':0.0', '#{session_path}')).strip()
+        if not raw_directory or not Path(raw_directory).is_dir():
+            raise ValueError('Папка сессии недоступна.')
+        folder = Path(raw_directory) / '.tgbridge-uploads'
+        if folder.is_symlink():
+            raise ValueError('Папка вложений не должна быть символической ссылкой.')
+        folder.mkdir(mode=0o700, exist_ok=True)
+        # Download into memory first: failed downloads leave no partial project files.
+        stream = BytesIO()
+        await self.bot.download(item.file_id, destination=stream)
+        data = stream.getvalue()
+        if len(data) > 20 * 1024 * 1024:
+            raise ValueError('Максимальный размер вложения — 20 МБ.')
+        original = getattr(item, 'file_name', None) or 'screenshot.jpg'
+        filename = re.sub(r'[^\w. -]', '_', Path(original).name)[:100] or 'attachment'
+        destination = folder / (uuid.uuid4().hex[:12] + '-' + filename)
+        with destination.open('xb') as file:
+            destination.chmod(0o600)
+            file.write(data)
+        payload = ((getattr(message, 'caption', None) or 'Посмотри вложенный файл')
+                   + '\nФайл: ' + shlex.quote(str(destination)))
+        if self.draft is not None:
+            if self.draft['session'] != name:
+                raise ValueError('Черновик относится к другой сессии. Вернись к ней или /cancel.')
+            if len(('\n\n'.join(self.draft['parts']) + payload).encode()) > 100_000:
+                raise ValueError('Черновик превышает 100 КБ. Файл сохранён, но не добавлен.')
+            self.draft['parts'].append(payload)
+            self.save_state()
+            await message.answer('📎 Вложение добавлено в задание. /submit — отправить.')
+        else:
+            await self.send_payload(name, payload)
+            await message.answer('📎 Файл сохранён и путь передан CLI: ' + self.clean(str(destination)))
+
+    async def send_log(self, message):
+        await self.target()
+        name = self.active
+        path = self.output_dir / (name + '.bin')
+        # Reconstruct a readable terminal transcript from the retained raw segments.
+        reader = ConsoleOutput(100, 35)
+        def render():
+            for segment in (path.with_suffix('.previous'), path):
+                if segment.exists():
+                    with segment.open('rb') as source:
+                        while data := source.read(65536):
+                            reader.feed(data)
+            rows = reader.screen.scrolled + reader.screen.display
+            return self.clean('\n'.join(row.rstrip() for row in rows).rstrip()).encode()
+        data = await asyncio.to_thread(render)
+        await self.bot.send_document(self.owner, BufferedInputFile(data or b'(empty)', filename=name + '.txt'),
+                                     caption='Сохранённый вывод (в пределах лимита хранения).')
+
+    async def action(self, query):
+        if query.from_user.id != self.owner or not query.message or query.message.chat.id != self.owner:
+            await answer_callback(query)
+            return
+        if not await answer_callback(query):
+            return
+        kind, value = query.data.split(':', 1)
+        if kind == 'cli' and value in self.profiles:
+            command = '/startcli ' + shlex.quote(value)
+        elif kind == 'mode' and value in ('compact', 'full', 'notify'):
+            command = '/settings ' + value
+        else:
+            return
+        await self.handle(query.message.model_copy(update={'from_user': query.from_user, 'text': command}))
 
     async def handle(self, message: Message):
         if message.from_user is None or message.from_user.id != self.owner or message.chat.id != self.owner:
             return
-        if not message.text:
+        if not message.text and not getattr(message, 'document', None) and not getattr(message, 'photo', None):
             return
         try:
             async with self.lock:
+                if not message.text:
+                    await self.attachment(message)
+                    return
                 text = MENU_ACTIONS.get(message.text, message.text)
                 # Keep replies below the user's latest message in the conversation.
                 self.output_messages.clear()
@@ -316,6 +579,47 @@ class Bridge:
                     await message.answer("🤖 <b>CLI · Telegram</b>\n\n" + escape(HELP), parse_mode="HTML", reply_markup=main_menu())
                     if command == "/start" and self.projects_dir:
                         await self.show_projects(message)
+                elif command == '/draft':
+                    await self.target()
+                    if self.draft is not None:
+                        raise ValueError('Задание уже составляется. /submit — отправить, /cancel — отменить.')
+                    self.draft = dict(session=self.active, parts=[])
+                    self.save_state()
+                    await message.answer('✍️ Присылай текст и вложения несколькими сообщениями. Затем нажми «📨 Отправить задание».')
+                elif command == '/cancel':
+                    self.draft = None
+                    self.save_state()
+                    await message.answer('Черновик отменён.')
+                elif command == '/submit':
+                    if not self.draft or not self.draft['parts']:
+                        raise ValueError('Пустое задание. Начни с /draft.')
+                    if self.draft['session'] != self.active:
+                        raise ValueError('Выбрана другая сессия. Вернись к сессии черновика или /cancel.')
+                    await self.send_payload(self.active, '\n\n'.join(self.draft['parts']))
+                    self.draft = None
+                    self.save_state()
+                    await message.answer('📨 Задание отправлено.')
+                elif command == '/resume':
+                    await self.target()
+                    await message.answer('↩️ ' + await self.session_label(self.active))
+                    await self.refresh(self.active, force=True)
+                elif command == '/cli':
+                    rows = [[InlineKeyboardButton(text=profile, callback_data='cli:' + profile)]
+                            for profile in self.profiles if len(profile.encode()) <= 59]
+                    await message.answer('Выбери CLI для запуска в домашней папке. Для другой папки: /startcli имя проект',
+                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+                elif command == '/settings':
+                    modes = {'compact': 'Компактный', 'full': 'Полный поток', 'notify': 'Только уведомления'}
+                    if arg:
+                        if arg not in modes:
+                            raise ValueError('/settings compact|full|notify')
+                        self.mode = arg
+                        self.save_state()
+                    await message.answer('Вывод: ' + modes[self.mode], reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text=label, callback_data='mode:' + mode)]
+                                         for mode, label in modes.items()]))
+                elif command == '/log':
+                    await self.send_log(message)
                 elif command == "/projects":
                     await self.show_projects(message)
                 elif command == "/profiles":
@@ -346,6 +650,8 @@ class Bridge:
                     await self.connect_output(name, seed=False)
                     await tmux("respawn-pane", "-k", "-t", name + ":0.0", "-c", str(cwd), shlex.join(["env", "PATH=" + str(Path(executable).parent) + os.pathsep + os.environ.get("PATH", os.defpath), *argv]))
                     self.active = name
+                    self.metadata[name] = dict(cli=parts[0], created=time.time(), directory=str(cwd))
+                    self.save_state()
                     await message.answer("🚀 <b>" + escape(parts[0]) + " запущен</b>\n📂 <code>"
                                          + escape(self.clean(str(cwd))) + "</code>\n🔖 <code>" + name + "</code>",
                                          parse_mode="HTML", reply_markup=self.keyboard())
@@ -357,10 +663,9 @@ class Bridge:
                     for offset in range(0, len(names), 40):
                         rows = []
                         for n in names[offset:offset + 40]:
-                            directory = await self.session_directory(n)
-                            label = self.project_label(directory)
+                            label = await self.session_label(n)
                             rows.append([InlineKeyboardButton(
-                                text=("🟢 " if n == self.active else "📁 ") + label[:60] + " · " + n,
+                                text=("🟢 " if n == self.active else "📁 ") + label[:120],
                                 callback_data="session:" + n)])
                         await message.answer("🖥 <b>Сессии</b>\nНа кнопках указаны папки, в которых открыты сессии."
                                              "\nНажми, чтобы переключиться.", parse_mode="HTML",
@@ -370,6 +675,7 @@ class Bridge:
                         raise ValueError("Укажи имя: /switch tgcli-имя")
                     await self.target(arg.strip())
                     self.active = arg.strip()
+                    self.save_state()
                     directory = await self.session_directory(self.active)
                     await message.answer("✅ <b>Выбрана сессия · " + escape(self.project_label(directory))
                                          + "</b>\n📂 Открыта в: <code>" + escape(directory or "Папка неизвестна")
@@ -384,8 +690,13 @@ class Bridge:
                     self.output_messages.pop(name, None)
                     (self.output_dir / (name + ".bin")).unlink(missing_ok=True)
                     self.finished.discard(name)
+                    self.offsets.pop(name, None)
+                    self.metadata.pop(name, None)
+                    self.waiting.pop(name, None)
+                    (self.output_dir / (name + ".previous")).unlink(missing_ok=True)
                     if self.active == name:
                         self.active = None
+                    self.save_state()
                     await message.answer("Сессия завершена: " + name)
                 elif command == "/attach":
                     await self.refresh(self.active, force=True)
@@ -393,9 +704,17 @@ class Bridge:
                     payload = arg if command == "/send" else text
                     if text.startswith("/") and command != "/send":
                         raise ValueError("Неизвестная команда. Для отправки в CLI: /send текст")
-                    target = await self.target()
-                    await tmux("send-keys", "-t", target, "-l", "--", payload)
-                    await tmux("send-keys", "-t", target, "Enter")
+                    await self.target()
+                    if self.draft is not None:
+                        if self.draft['session'] != self.active:
+                            raise ValueError('Черновик относится к другой сессии. Вернись к ней или /cancel.')
+                        if len(('\n\n'.join(self.draft['parts']) + payload).encode()) > 100_000:
+                            raise ValueError('Черновик превышает 100 КБ.')
+                        self.draft['parts'].append(payload)
+                        self.save_state()
+                        await message.answer(f"✍️ Добавлено частей: {len(self.draft['parts'])}. /submit — отправить.")
+                    else:
+                        await self.send_payload(self.active, payload)
         except (ValueError, RuntimeError) as exc:
             await self.output(str(exc))
 
@@ -425,6 +744,15 @@ class Bridge:
                 await tmux("send-keys", "-t", await self.target(name), KEYS[key])
         except (ValueError, RuntimeError) as exc:
             await self.output(str(exc))
+
+    async def delivery_worker(self):
+        while True:
+            for name in list(self.outboxes):
+                try:
+                    await self.deliver_output(name)
+                except Exception:
+                    logging.exception("Не удалось доставить вывод")
+            await asyncio.sleep(1)
 
     async def watch(self):
         while True:
@@ -457,9 +785,12 @@ async def run():
     projects_dir = os.getenv("PROJECTS_DIR", "").strip()
     async with Bot(token) as bot:
         bridge = Bridge(bot, owner, profiles, secrets, interval, projects_dir)
+        bridge.load_state()
         dp = Dispatcher()
         dp.message.register(bridge.handle)
+        dp.callback_query.register(bridge.action, F.data.startswith('cli:') | F.data.startswith('mode:'))
         dp.callback_query.register(bridge.session, F.data.startswith("session:"))
+        dp.callback_query.register(bridge.agent, F.data.startswith('agent:'))
         dp.callback_query.register(bridge.project, F.data.startswith("project:"))
         dp.callback_query.register(bridge.key, F.data.startswith("key:"))
         async def on_startup():
@@ -470,11 +801,14 @@ async def run():
                 logging.exception("Не удалось отправить меню при запуске бота")
         dp.startup.register(on_startup)
         task = asyncio.create_task(bridge.watch())
+        delivery_task = asyncio.create_task(bridge.delivery_worker())
         try:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            delivery_task.cancel()
+            await asyncio.gather(task, delivery_task, return_exceptions=True)
+            bridge.save_state()
 
 
 def main():

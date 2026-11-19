@@ -38,15 +38,16 @@ class ConsoleOutput:
     def feed(self, data):
         self.stream.feed(self.decoder.decode(data))
 
-    def pending(self, force=False):
-        rows = [visible_line(row) for row in self.screen.scrolled + self.screen.display]
-        current = [visible_line(row) for row in self.screen.display]
+    def pending(self, force=False, raw=False):
+        normalize = (lambda row: row.rstrip()) if raw else visible_line
+        rows = [normalize(row) for row in self.screen.scrolled + self.screen.display]
+        current = [normalize(row) for row in self.screen.display]
         while rows and not rows[-1]:
             rows.pop()
         while current and not current[-1]:
             current.pop()
         if force:
-            added = current
+            added = rows
         else:
             added = []
             for tag, _, _, start, end in SequenceMatcher(None, self.previous, rows, autojunk=False).get_opcodes():
