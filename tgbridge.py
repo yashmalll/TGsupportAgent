@@ -60,7 +60,7 @@ HELP = """/menu — показать меню кнопок
 /stop имя — завершить сессию
 Обычный текст отправляется в выбранный CLI с Enter.
 Кнопки управляют выбранной сессией. Команды CLI можно отправить текстом /send текст.
-Новый вывод приходит отдельными сообщениями; анимации отфильтровываются.
+Вывод дополняется в одном сообщении; длинные ответы продолжаются в следующих.
 /attach повторно показывает текущий экран."""
 
 
@@ -100,6 +100,7 @@ class Bridge:
         self.project_choices = {}
         self.streams = {}
         self.outboxes = {}
+        self.output_messages = {}
         self.output_dir = Path(__file__).resolve().parent / ".tgbridge-output"
         self.finished = set()
         self.lock = asyncio.Lock()
@@ -109,6 +110,14 @@ class Bridge:
             if value:
                 text = text.replace(value, "[REDACTED]")
         return text
+
+    async def announce_startup(self):
+        await self.bot.send_message(self.owner,
+            "🤖 Бот запущен и готов к работе.\n\n"
+            "🚀 Запустить Codex — открыть новую сессию в домашней папке.\n"
+            "📂 Проекты — выбрать папку и запустить Codex в ней.\n"
+            "🖥 Сессии — вернуться к ранее открытой сессии.\n\n"
+            "Выбери действие кнопками ниже.", reply_markup=main_menu())
 
     def projects(self):
         if self.projects_dir is None:
@@ -176,6 +185,22 @@ class Bridge:
             raise ValueError("Выбери существующую сессию через /sessions и /switch имя.")
         return name + ":0.0"
 
+    async def session_directory(self, name):
+        """The session's original directory survives bot and CLI restarts in tmux."""
+        try:
+            path = (await tmux("display-message", "-p", "-t", name + ":0.0",
+                               "#{session_path}")).strip()
+        except RuntimeError:
+            return None
+        return self.clean(path) or None
+
+    def project_label(self, directory):
+        if not directory:
+            return "Папка неизвестна"
+        if directory == str(Path.home()):
+            return "Домашняя папка"
+        return Path(directory).name or directory
+
     def keyboard(self):
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=k, callback_data=f"key:{self.active}:{k}") for k in row]
@@ -211,6 +236,8 @@ class Bridge:
             await self.connect_output(name)
         reader = self.streams[name]
         await self.deliver_output(name)
+        if force:
+            self.output_messages.pop(name, None)
         path = self.output_dir / (name + ".bin")
         with path.open("rb") as source:
             source.seek(reader.offset)
@@ -248,9 +275,29 @@ class Bridge:
         queue = self.outboxes.setdefault(name, [])
         while queue:
             chunk, controls = queue[0]
-            await self.bot.send_message(self.owner,
-                "<code>" + escape(name) + "</code>\n<pre>" + escape(chunk) + "</pre>",
-                parse_mode="HTML", reply_markup=self.keyboard() if controls else None)
+            previous = self.output_messages.get(name)
+            combined = previous[1] + "\n" + chunk if previous else chunk
+            merge = previous is not None and len(combined.encode('utf-16-le')) // 2 <= 3200
+            body = combined if merge else chunk
+            formatted = "<code>" + escape(name) + "</code>\n<pre>" + escape(body) + "</pre>"
+            markup = self.keyboard() if controls else None
+            if merge:
+                try:
+                    await self.bot.edit_message_text(formatted, chat_id=self.owner,
+                        message_id=previous[0], parse_mode="HTML", reply_markup=markup)
+                except TelegramBadRequest as exc:
+                    reason = str(exc).lower()
+                    if "message is not modified" not in reason:
+                        if "message to edit not found" in reason or "message can't be edited" in reason:
+                            self.output_messages.pop(name, None)
+                            continue
+                        raise
+                message_id = previous[0]
+            else:
+                sent = await self.bot.send_message(self.owner, formatted,
+                    parse_mode="HTML", reply_markup=markup, disable_notification=True)
+                message_id = sent.message_id
+            self.output_messages[name] = (message_id, body)
             queue.pop(0)
 
     async def handle(self, message: Message):
@@ -261,6 +308,8 @@ class Bridge:
         try:
             async with self.lock:
                 text = MENU_ACTIONS.get(message.text, message.text)
+                # Keep replies below the user's latest message in the conversation.
+                self.output_messages.clear()
                 command, _, arg = text.partition(" ")
                 command = command.split("@")[0]
                 if command in ("/start", "/help", "/menu"):
@@ -306,15 +355,25 @@ class Bridge:
                         await message.answer("🖥 Нет сессий. Нажми «🚀 Запустить Codex» или выбери проект.",
                                              reply_markup=main_menu())
                     for offset in range(0, len(names), 40):
-                        rows = [[InlineKeyboardButton(text=("🟢 " if n == self.active else "🖥 ") + n,
-                                 callback_data="session:" + n)] for n in names[offset:offset + 40]]
-                        await message.answer("🖥 <b>Сессии</b>\nНажми, чтобы переключиться.", parse_mode="HTML",
+                        rows = []
+                        for n in names[offset:offset + 40]:
+                            directory = await self.session_directory(n)
+                            label = self.project_label(directory)
+                            rows.append([InlineKeyboardButton(
+                                text=("🟢 " if n == self.active else "📁 ") + label[:60] + " · " + n,
+                                callback_data="session:" + n)])
+                        await message.answer("🖥 <b>Сессии</b>\nНа кнопках указаны папки, в которых открыты сессии."
+                                             "\nНажми, чтобы переключиться.", parse_mode="HTML",
                                              reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
                 elif command == "/switch":
                     if not arg.strip():
                         raise ValueError("Укажи имя: /switch tgcli-имя")
                     await self.target(arg.strip())
                     self.active = arg.strip()
+                    directory = await self.session_directory(self.active)
+                    await message.answer("✅ <b>Выбрана сессия · " + escape(self.project_label(directory))
+                                         + "</b>\n📂 Открыта в: <code>" + escape(directory or "Папка неизвестна")
+                                         + "</code>\n🔖 <code>" + escape(self.active) + "</code>", parse_mode="HTML")
                     await self.refresh(self.active, force=True)
                 elif command == "/stop":
                     name = arg.strip() or self.active
@@ -322,6 +381,7 @@ class Bridge:
                     await tmux("kill-session", "-t", name)
                     self.streams.pop(name, None)
                     self.outboxes.pop(name, None)
+                    self.output_messages.pop(name, None)
                     (self.output_dir / (name + ".bin")).unlink(missing_ok=True)
                     self.finished.discard(name)
                     if self.active == name:
@@ -402,6 +462,13 @@ async def run():
         dp.callback_query.register(bridge.session, F.data.startswith("session:"))
         dp.callback_query.register(bridge.project, F.data.startswith("project:"))
         dp.callback_query.register(bridge.key, F.data.startswith("key:"))
+        async def on_startup():
+            try:
+                await bridge.announce_startup()
+            except Exception:
+                # An unavailable owner chat must not prevent the bot from starting.
+                logging.exception("Не удалось отправить меню при запуске бота")
+        dp.startup.register(on_startup)
         task = asyncio.create_task(bridge.watch())
         try:
             await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
